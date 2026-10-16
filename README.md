@@ -3,7 +3,7 @@
 The CLI for the open agent skills ecosystem.
 
 <!-- agent-list:start -->
-Supports **OpenCode**, **Claude Code**, **Codex**, **Cursor**, and [75 more](#supported-agents).
+Supports **OpenCode**, **Claude Code**, **Codex**, **Cursor**, and [76 more](#supported-agents).
 <!-- agent-list:end -->
 
 <p>
@@ -288,6 +288,7 @@ Skills can be installed to any of these agents:
 | Antigravity | `antigravity` | `.agents/skills/` | `~/.gemini/antigravity/skills/` |
 | Antigravity CLI | `antigravity-cli` | `.agents/skills/` | `~/.gemini/antigravity-cli/skills/` |
 | AstrBot | `astrbot` | `data/skills/` | `~/.astrbot/data/skills/` |
+| ATeam | `ateam` | `.ateam/skills/` | `~/.ateam/skills/` |
 | Autohand Code CLI | `autohand-code` | `.autohand/skills/` | `~/.autohand/skills/` |
 | Augment | `augment` | `.augment/skills/` | `~/.augment/skills/` |
 | IBM Bob | `bob` | `.bob/skills/` | `~/.bob/skills/` |
@@ -429,6 +430,7 @@ discover `SKILL.md` files outside these container directories (e.g. under
 - `.aider-desk/skills/`
 - `.agents/skills/`
 - `data/skills/`
+- `.ateam/skills/`
 - `.autohand/skills/`
 - `.augment/skills/`
 - `.bob/skills/`
@@ -559,6 +561,7 @@ GitHub repository and skill identifiers are sent only for repositories that GitH
 - [Antigravity Skills Documentation](https://antigravity.google/docs/skills)
 - [Factory AI / Droid Skills Documentation](https://docs.factory.ai/cli/configuration/skills)
 - [Claude Code Skills Documentation](https://code.claude.com/docs/en/skills)
+- [ATeam Skills Documentation](https://github.com/EMSERO/ateam/blob/main/docs/skills.md)
 - [OpenClaw Skills Documentation](https://docs.openclaw.ai/tools/skills)
 - [Cline Skills Documentation](https://docs.cline.bot/features/skills)
 - [CodeBuddy Skills Documentation](https://www.codebuddy.ai/docs/ide/Features/Skills)

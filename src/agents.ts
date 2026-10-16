@@ -125,6 +125,15 @@ export const agents: Record<AgentType, AgentConfig> = {
       return existsSync(join(process.cwd(), 'data/skills')) || existsSync(join(home, '.astrbot'));
     },
   },
+  ateam: {
+    name: 'ateam',
+    displayName: 'ATeam',
+    skillsDir: '.ateam/skills',
+    globalSkillsDir: join(home, '.ateam', 'skills'),
+    detectInstalled: async () => {
+      return existsSync(join(home, '.ateam'));
+    },
+  },
   'autohand-code': {
     name: 'autohand-code',
     displayName: 'Autohand Code CLI',

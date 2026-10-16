@@ -4,6 +4,7 @@ export type AgentType =
   | 'antigravity'
   | 'antigravity-cli'
   | 'astrbot'
+  | 'ateam'
   | 'autohand-code'
   | 'augment'
   | 'bob'
