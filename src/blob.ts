@@ -17,6 +17,7 @@ import { sanitizeMetadata } from './sanitize.ts';
 import { getGitHubHost } from './github-host.ts';
 import type { Skill } from './types.ts';
 import { DEFAULT_SKILL_CONTAINER_DEPTH } from './constants.ts';
+import { AGENT_PROJECT_SKILL_DIRS } from './agent-project-dirs.ts';
 
 // ─── Types ───
 
@@ -309,36 +310,9 @@ const PRIORITY_PREFIXES = [
   'skills/.curated/',
   'skills/.experimental/',
   'skills/.system/',
-  '.agents/skills/',
-  '.claude/skills/',
-  '.cline/skills/',
-  '.codebuddy/skills/',
-  '.codex/skills/',
-  '.commandcode/skills/',
-  '.continue/skills/',
-  '.factory/skills/',
-  '.github/skills/',
-  '.goose/skills/',
-  '.grok/skills/',
-  '.iflow/skills/',
-  '.junie/skills/',
-  '.kilo/skills/',
-  '.kilocode/skills/',
-  '.kimchi/skills/',
-  '.kiro/skills/',
-  '.minimax/skills/',
-  '.mux/skills/',
-  '.neovate/skills/',
-  '.opencode/skills/',
-  '.openhands/skills/',
-  '.pi/skills/',
-  '.posit/assistant/skills/',
-  '.qoder/skills/',
-  '.roo/skills/',
-  '.trae/skills/',
-  '.windsurf/skills/',
-  '.zcode/skills/',
-  '.zencoder/skills/',
+  // The same list the local scan searches, so the blob fast path cannot drift
+  // from it. sync-agents.ts keeps the list in step with the agents registry (#2502).
+  ...AGENT_PROJECT_SKILL_DIRS.map((dir) => `${dir}/`),
 ];
 
 /**

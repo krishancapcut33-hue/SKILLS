@@ -4,6 +4,7 @@ import { readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { agents } from '../src/agents.ts';
+import { AGENT_PROJECT_SKILL_DIRS } from '../src/agent-project-dirs.ts';
 
 const ROOT = join(import.meta.dirname, '..');
 const README_PATH = join(ROOT, 'README.md');
@@ -61,6 +62,23 @@ function generateAvailableAgentsTable(): string {
   ].join('\n');
 }
 
+/** Fails the sync when discovery searches a directory the registry doesn't have. */
+function verifySkillDiscoveryDirs(): void {
+  const registered = [...new Set(Object.values(agents).map((a) => a.skillsDir))]
+    .filter((p) => p !== 'skills')
+    .sort();
+  const searched = [...AGENT_PROJECT_SKILL_DIRS].sort();
+  const missing = registered.filter((p) => !searched.includes(p));
+  const extra = searched.filter((p) => !registered.includes(p));
+  if (missing.length === 0 && extra.length === 0) return;
+  throw new Error(
+    `src/agent-project-dirs.ts is out of sync with the agents registry.\n` +
+      `  searched but not registered: ${extra.join(', ') || '(none)'}\n` +
+      `  registered but not searched: ${missing.join(', ') || '(none)'}\n` +
+      `  Update AGENT_PROJECT_SKILL_DIRS, then re-run this script. (#2502)`
+  );
+}
+
 function generateSkillDiscoveryPaths(): string {
   const standardPaths = [
     '- Root directory (if it contains `SKILL.md`)',
@@ -97,6 +115,8 @@ function replaceSection(
 }
 
 function main() {
+  verifySkillDiscoveryDirs();
+
   let readme = readFileSync(README_PATH, 'utf-8');
 
   readme = replaceSection(readme, 'agent-list', generateAgentList());
