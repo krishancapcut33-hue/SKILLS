@@ -3,7 +3,7 @@ import { execFileSync } from 'child_process';
 import { existsSync, rmSync, mkdirSync, writeFileSync, lstatSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { runCli, stripAnsi } from './test-utils.ts';
+import { createTestHomeEnvironment, runCli, stripAnsi } from './test-utils.ts';
 import { shouldInstallInternalSkills } from './skills.ts';
 import {
   parseAddOptions,
@@ -42,15 +42,7 @@ const noDetectedAgentEnv = {
 function isolatedAgentEnv(home: string): Record<string, string> {
   return {
     ...noDetectedAgentEnv,
-    APPDATA: join(home, 'appdata'),
-    AUTOHAND_HOME: join(home, '.autohand'),
-    CLAUDE_CONFIG_DIR: join(home, '.claude'),
-    CODEX_HOME: join(home, '.codex'),
-    FLATPAK_XDG_CONFIG_HOME: join(home, '.flatpak-config'),
-    HERMES_HOME: join(home, '.hermes'),
-    HOME: home,
-    VIBE_HOME: join(home, '.vibe'),
-    XDG_CONFIG_HOME: join(home, '.config'),
+    ...createTestHomeEnvironment(home),
   };
 }
 
@@ -435,8 +427,11 @@ description: PromptScript global regression
     const output = result.stdout + result.stderr;
 
     expect(result.exitCode).toBe(0);
-    expect(output).not.toContain('PromptScript does not support global skill installation');
+    expect(output).not.toContain('PromptScript');
     expect(output).not.toContain('Failed to install');
+    expect(
+      existsSync(join(projectDir, '.agents', 'skills', 'promptscript-global-skill', 'SKILL.md'))
+    ).toBe(true);
   });
 
   it('should not prefer detected Eve when global install targets are implicit', () => {
@@ -470,8 +465,114 @@ description: Eve global regression
 
     expect(result.exitCode).toBe(0);
     expect(output).not.toContain('Installing to: eve agent');
-    expect(output).not.toContain('Eve does not support global skill installation');
+    expect(output).not.toContain('Eve');
     expect(output).not.toContain('Failed to install');
+    expect(existsSync(join(projectDir, '.agents', 'skills', 'eve-global-skill', 'SKILL.md'))).toBe(
+      true
+    );
+  });
+
+  describe('global agent selection through the CLI', () => {
+    let sourceDir: string;
+    let projectDir: string;
+    let homeDir: string;
+
+    beforeEach(() => {
+      sourceDir = join(testDir, 'source');
+      projectDir = join(testDir, 'project');
+      homeDir = join(testDir, 'home');
+      mkdirSync(projectDir, { recursive: true });
+      mkdirSync(homeDir, { recursive: true });
+      for (const name of ['scope-one', 'scope-two']) {
+        const skillDir = join(sourceDir, name);
+        mkdirSync(skillDir, { recursive: true });
+        writeFileSync(
+          join(skillDir, 'SKILL.md'),
+          `---\nname: ${name}\ndescription: Global scope regression\n---\n\n# ${name}\n`
+        );
+      }
+    });
+
+    it.each([
+      { label: 'agent wildcard', args: ['--agent', '*'], names: ['scope-one'] },
+      { label: '--all', args: ['--all'], names: ['scope-one', 'scope-two'] },
+      {
+        label: '--all overriding a named agent',
+        args: ['--agent', 'promptscript', '--all'],
+        names: ['scope-one', 'scope-two'],
+      },
+    ])('installs compatible global targets for $label', ({ args, names }) => {
+      const result = runCli(
+        ['add', sourceDir, '-g', '-y', '-s', 'scope-one', ...args],
+        projectDir,
+        isolatedAgentEnv(homeDir)
+      );
+      const output = result.stdout + result.stderr;
+
+      expect(result.exitCode).toBe(0);
+      expect(output).not.toContain('PromptScript');
+      expect(output).not.toContain('Eve');
+      expect(output).not.toContain('Failed to install');
+      for (const name of names) {
+        expect(
+          readFileSync(join(homeDir, '.agents', 'skills', name, 'SKILL.md'), 'utf-8')
+        ).toContain(`# ${name}`);
+      }
+      expect(existsSync(join(projectDir, '.agents', 'skills'))).toBe(false);
+    });
+
+    it.each([
+      { targets: ['promptscript'], installsCodex: false },
+      { targets: ['codex', 'promptscript'], installsCodex: true },
+    ])('keeps explicit unsupported targets visible: $targets', ({ targets, installsCodex }) => {
+      const result = runCli(
+        ['add', sourceDir, '-g', '-y', '-s', 'scope-one', '--agent', ...targets],
+        projectDir,
+        isolatedAgentEnv(homeDir)
+      );
+      const output = result.stdout + result.stderr;
+
+      expect(output).toContain('Failed to install 1');
+      expect(output).toContain('PromptScript does not support global skill installation');
+      expect(existsSync(join(homeDir, '.agents', 'skills', 'scope-one', 'SKILL.md'))).toBe(
+        installsCodex
+      );
+    });
+
+    it.each([
+      { label: 'detected agents', args: [] },
+      { label: 'agent wildcard', args: ['--agent', '*'] },
+      { label: '--all', args: ['--all'] },
+    ])('keeps --subagent explicit for global JSON installs with $label', ({ args }) => {
+      const result = runCli(
+        ['add', sourceDir, '-g', '-y', '-s', 'scope-one', '--subagent', 'root', '--json', ...args],
+        projectDir,
+        isolatedAgentEnv(homeDir)
+      );
+
+      expect(result.exitCode).toBe(1);
+      const results = JSON.parse(result.stdout);
+      expect(results.length).toBeGreaterThan(0);
+      for (const entry of results) {
+        expect(entry.status).toBe('failed');
+        expect(entry.error).toBe('Eve does not support global skill installation');
+      }
+      expect(existsSync(join(homeDir, '.agents', 'skills', 'scope-one', 'SKILL.md'))).toBe(true);
+    });
+
+    it('keeps PromptScript available for implicit project installs', () => {
+      writeFileSync(join(projectDir, 'promptscript.yaml'), 'name: scope-project\n');
+      const result = runCli(
+        ['add', sourceDir, '-y', '-s', 'scope-one'],
+        projectDir,
+        isolatedAgentEnv(homeDir)
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain('PromptScript');
+      expect(result.stdout).not.toContain('Failed to install');
+      expect(existsSync(join(projectDir, '.agents', 'skills', 'scope-one', 'SKILL.md'))).toBe(true);
+    });
   });
 
   it('should filter skills by name with --skill flag', () => {
