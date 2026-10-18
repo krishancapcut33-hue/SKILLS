@@ -37,6 +37,9 @@ npx skills use vercel-labs/agent-skills --skill web-design-guidelines --agent cl
 # GitHub shorthand (owner/repo)
 npx skills add vercel-labs/agent-skills
 
+# Pin a release tag or full commit. Skill names still use the same @ form.
+npx skills add owner/repo@v1.2.3 --skill my-skill
+
 # Full GitHub URL
 npx skills add https://github.com/vercel-labs/agent-skills
 

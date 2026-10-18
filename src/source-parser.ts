@@ -313,6 +313,20 @@ function parseFragmentRef(input: string): FragmentRefResult {
   };
 }
 
+/**
+ * `owner/repo@name` selects a skill. A release tag or full commit in that
+ * position is a checkout pin, the same as `owner/repo#ref`. Other names,
+ * including branch names, stay skill selectors so `owner/repo@my-skill`
+ * is unchanged. Branch pins use `#ref`.
+ */
+function isVersionPin(value: string): boolean {
+  return (
+    /^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(
+      value
+    ) || /^[0-9a-f]{40}$/i.test(value)
+  );
+}
+
 function appendFragmentRef(input: string, ref?: string, skillFilter?: string): string {
   if (!ref) {
     return input;
@@ -525,10 +539,20 @@ export function parseSource(input: string): ParsedSource {
   const githubHost = getGitHubHost();
   const shorthandSourceType = githubHost === 'github.com' ? 'github' : 'git';
 
-  // First check for @skill syntax: owner/repo@skill-name
+  // First check for @skill syntax: owner/repo@skill-name.
+  // A release tag or full SHA (`owner/repo@v1.2.3`) is a checkout pin, not a
+  // skill name. Otherwise the tag is printed as a filter and the install
+  // uses the default branch (#2526).
   const atSkillMatch = input.match(/^([^/]+)\/([^/@]+)@(.+)$/);
   if (atSkillMatch && !input.includes(':') && !input.startsWith('.') && !input.startsWith('/')) {
     const [, owner, repo, skillFilter] = atSkillMatch;
+    if (!fragmentRef && !fragmentSkillFilter && isVersionPin(skillFilter!)) {
+      return {
+        type: shorthandSourceType,
+        url: `https://${githubHost}/${owner}/${repo}.git`,
+        ref: skillFilter,
+      };
+    }
     return {
       type: shorthandSourceType,
       url: `https://${githubHost}/${owner}/${repo}.git`,
