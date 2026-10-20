@@ -65,7 +65,7 @@ vi.mock('../src/blob.ts', async (importActual) => {
   };
 });
 
-import { runAdd } from '../src/add.ts';
+import { runAdd, prepareSourceInstall, cleanupPreparedSource } from '../src/add.ts';
 import { cloneRepo } from '../src/git.ts';
 import { tryBlobInstall } from '../src/blob.ts';
 
@@ -110,4 +110,64 @@ describe('blob clone fallback output', () => {
     expect(spinnerMessage).toHaveBeenCalledWith('Cloning repository…');
     expect(spinnerStop).toHaveBeenCalledWith('Repository cloned');
   });
+  it('stops the spinner when initial source resolution fails', async () => {
+    vi.mocked(cloneRepo).mockRejectedValueOnce(new Error('clone failed'));
+    await expect(
+      prepareSourceInstall({ type: 'git', url: 'file:///missing.git' }, [])
+    ).rejects.toThrow('clone failed');
+    expect(spinnerStop).toHaveBeenCalledWith('Resolution failed');
+  });
+
+  it.each([false, true])(
+    'uses one pinned checkout only when dependencies are required (%s)',
+    async (required) => {
+      const metadata = required ? { dependencies: 'dependency' } : {};
+      const content = `---\nname: fallback-skill\ndescription: Clone content\nmetadata: ${JSON.stringify(metadata)}\n---\n`;
+      await writeFile(join(fixture, 'skill', 'SKILL.md'), content);
+      await mkdir(join(fixture, 'dependency'));
+      await writeFile(
+        join(fixture, 'dependency', 'SKILL.md'),
+        '---\nname: dependency\ndescription: Sibling skill\n---\n'
+      );
+      vi.mocked(tryBlobInstall).mockResolvedValueOnce({
+        skills: [
+          {
+            name: 'fallback-skill',
+            description: 'Snapshot content',
+            path: '/snapshot',
+            metadata,
+            files: [],
+            snapshotHash: 'snapshot',
+            repoPath: 'skill/SKILL.md',
+          },
+        ],
+        tree: { sha: 'snapshot', branch: 'main', tree: [] },
+      });
+      const prepared = await prepareSourceInstall(
+        {
+          type: 'github',
+          url: 'https://github.com/vercel/fixture.git',
+          subpath: 'skill',
+          ref: 'v1',
+        },
+        ['fallback-skill']
+      );
+      try {
+        if (required) {
+          expect(cloneRepo).toHaveBeenCalledExactlyOnceWith(
+            'https://github.com/vercel/fixture.git',
+            'v1'
+          );
+          expect(prepared.selected.map((s) => s.name)).toEqual(['dependency', 'fallback-skill']);
+          expect(prepared.selected[1]?.rawContent).toBe(content);
+          expect(prepared.resolved.blobResult).toBeNull();
+        } else {
+          expect(cloneRepo).not.toHaveBeenCalled();
+          expect(prepared.resolved.blobResult).not.toBeNull();
+        }
+      } finally {
+        await cleanupPreparedSource(prepared);
+      }
+    }
+  );
 });

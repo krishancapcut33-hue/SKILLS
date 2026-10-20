@@ -1,4 +1,10 @@
 import * as p from '@clack/prompts';
+import {
+  skillDependencies,
+  rejectUnsupportedDependencies,
+  resolveSameSourceDependencies,
+  resolveDependencyGraph,
+} from './skill-dependencies.ts';
 import pc from 'picocolors';
 import { existsSync } from 'fs';
 import { homedir } from 'os';
@@ -757,6 +763,8 @@ async function handleWellKnownSkills(
     selectedSkills = selected as WellKnownSkill[];
   }
 
+  rejectUnsupportedDependencies(selectedSkills, 'well-known sources');
+
   // Detect agents
   let targetAgents: AgentType[];
   const validAgents = Object.keys(agents);
@@ -1223,6 +1231,49 @@ async function resolveSkills(
   return { skills, tempDir, blobResult };
 }
 
+async function resolveSelectedDependencies(
+  parsed: ParsedSource,
+  resolved: ResolvedSkills,
+  selected: Skill[],
+  spinner: Spinner
+): Promise<Skill[]> {
+  const needsDependencies = selected.some((skill) => skillDependencies(skill).length > 0);
+  if (!needsDependencies) return selected;
+  if (parsed.type === 'download' || parsed.type === 'well-known') {
+    rejectUnsupportedDependencies(selected, parsed.type);
+  }
+  if (resolved.blobResult) {
+    spinner.start('Cloning repository for same-source dependencies…');
+    resolved.tempDir = await cloneRepo(parsed.url, parsed.ref);
+    const discovered = await discoverSkills(resolved.tempDir, parsed.subpath, {
+      includeInternal: true,
+      includeDuplicateNames: true,
+      fullDepth: true,
+    });
+    selected = selected.map((root) => {
+      const matches = discovered.filter((skill) => skill.name === root.name);
+      if (matches.length !== 1)
+        throw new Error(`${root.name}: missing or ambiguous skill in checkout`);
+      return matches[0]!;
+    });
+    resolved.blobResult = null;
+    spinner.stop('Repository cloned');
+  }
+  const expanded = await resolveSameSourceDependencies(
+    selected,
+    parsed.localPath ?? resolved.tempDir!
+  );
+  for (const skill of expanded) {
+    if (!selected.some((root) => root.path === skill.path)) {
+      const consumers = expanded.filter((s) => skillDependencies(s).includes(skill.name));
+      p.log.info(
+        `Adding dependency ${skill.name} (required by ${consumers.map((s) => s.name).join(', ')})`
+      );
+    }
+  }
+  return expanded;
+}
+
 type TargetInstallResult = Awaited<ReturnType<typeof installSkillForAgent>> & {
   skill: string;
   agent: string;
@@ -1329,6 +1380,39 @@ interface SourceInstallResult {
   error?: string;
 }
 
+export interface PreparedSourceInstall {
+  resolved: ResolvedSkills;
+  roots: Skill[];
+  selected: Skill[];
+}
+
+/** Prepare once before confirmation; the caller must clean up the returned source. */
+export async function prepareSourceInstall(
+  parsed: ParsedSource,
+  skills: string[]
+): Promise<PreparedSourceInstall> {
+  const spinner = p.spinner();
+  let resolved: ResolvedSkills | undefined;
+  try {
+    resolved = await resolveSkills(parsed, { includeInternal: skills.length > 0 }, spinner);
+    let selected = skills.length ? filterSkills(resolved.skills, skills) : resolved.skills;
+    if (!selected.length) throw new Error('No matching skills found');
+    const rootNames = new Set(selected.map((skill) => skill.name));
+    selected = await resolveSelectedDependencies(parsed, resolved, selected, spinner);
+    const roots = selected.filter((skill) => rootNames.has(skill.name));
+    spinner.stop(`Found ${selected.length} skills`);
+    return { resolved, roots, selected };
+  } catch (error) {
+    spinner.stop('Resolution failed');
+    await cleanup(resolved?.tempDir ?? null);
+    throw error;
+  }
+}
+
+export async function cleanupPreparedSource(prepared: PreparedSourceInstall): Promise<void> {
+  await cleanup(prepared.resolved.tempDir);
+}
+
 /**
  * Install skills from `parsed` at project scope without prompting or exiting:
  * keep `skills` (all when empty), let `select` drop any, install into
@@ -1340,27 +1424,30 @@ export async function installFromSource(
     skills: string[];
     agents: AgentType[];
     via?: string;
+    copy?: boolean;
+    prepared?: PreparedSourceInstall;
     select?: (skills: Skill[]) => Promise<Skill[]>;
   }
 ): Promise<SourceInstallResult> {
-  const spinner = p.spinner();
-  let resolved: ResolvedSkills | null = null;
+  let prepared = options.prepared;
   try {
-    resolved = await resolveSkills(parsed, { includeInternal: options.skills.length > 0 }, spinner);
-    let selected =
-      options.skills.length > 0 ? filterSkills(resolved.skills, options.skills) : resolved.skills;
-    if (selected.length === 0) {
-      spinner.stop(pc.red('No matching skills found'));
-      return { installed: [], failed: [], error: 'No matching skills found' };
+    prepared ??= await prepareSourceInstall(parsed, options.skills);
+    const { resolved } = prepared;
+    let selected = prepared.selected;
+    if (options.select) {
+      selected = await options.select(selected);
+      // A retained root must not regain a dependency removed by the filter.
+      selected = resolveDependencyGraph(
+        prepared.roots.filter((root) => selected.includes(root)),
+        selected
+      );
     }
-    spinner.stop(`Found ${pc.green(selected.length)} skill${selected.length > 1 ? 's' : ''}`);
-    if (options.select) selected = await options.select(selected);
 
     const results = await installToTargets(
       resolved,
       selected,
       options.agents.map((agent) => ({ agent })),
-      { global: false, mode: 'symlink', createMissingAgentRoot: () => true }
+      { global: false, mode: options.copy ? 'copy' : 'symlink', createMissingAgentRoot: () => true }
     );
     const installed = new Set(results.filter((r) => r.success).map((r) => r.skill));
     const repoPaths = getSkillRepoPaths(resolved, selected);
@@ -1374,14 +1461,13 @@ export async function installFromSource(
       failed: results.filter((r) => !r.success).map((r) => `${r.skill} → ${r.agent}: ${r.error}`),
     };
   } catch (error) {
-    spinner.stop(pc.red('Installation failed'));
     return {
       installed: [],
       failed: [],
       error: error instanceof Error ? error.message : String(error),
     };
   } finally {
-    await cleanup(resolved?.tempDir ?? null);
+    if (prepared && !options.prepared) await cleanupPreparedSource(prepared);
   }
 }
 
@@ -1628,7 +1714,8 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
       { includeInternal, fullDepth: options.fullDepth },
       spinner
     );
-    const { skills, blobResult } = resolved;
+    const { skills } = resolved;
+    let { blobResult } = resolved;
     // a Notion source already owns tempDir; a local resolve has none of its own
     tempDir = resolved.tempDir ?? tempDir;
 
@@ -1787,6 +1874,14 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
       }
 
       selectedSkills = selected as Skill[];
+    }
+
+    try {
+      if (directDownload) rejectUnsupportedDependencies(selectedSkills, 'independent downloads');
+      selectedSkills = await resolveSelectedDependencies(parsed, resolved, selectedSkills, spinner);
+    } finally {
+      tempDir = resolved.tempDir ?? tempDir;
+      blobResult = resolved.blobResult;
     }
 
     // Kick off the security audit only after GitHub has positively confirmed
