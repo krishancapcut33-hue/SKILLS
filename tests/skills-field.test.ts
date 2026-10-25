@@ -13,28 +13,63 @@ describe('parseSkillsField', () => {
         { package: '@vueuse/skills', skills: [] },
         { package: 'my-lib', skills: ['a', 'b'] },
       ],
-      remote: 0,
+      remote: [],
       errors: [],
     });
   });
 
-  it('counts remote entries without parsing them', () => {
-    const parsed = parseSkillsField(
-      ['owner/repo@skill', { source: 'owner/repo', ref: 'v1' }, 'npm:x'],
+  it('parses git sources, folding @skill and ref into the request', () => {
+    const { remote, errors } = parseSkillsField(
+      [
+        'owner/repo@one',
+        { source: 'owner/repo', ref: 'v1', skills: ['two'] },
+        'https://gitlab.com/group/repo/-/tree/main/skills',
+      ],
       '.'
     );
-    expect(parsed.remote).toBe(2);
-    expect(parsed.npm).toHaveLength(1);
+    expect(errors).toEqual([]);
+    expect(remote).toEqual([
+      {
+        parsed: expect.objectContaining({
+          type: 'github',
+          url: 'https://github.com/owner/repo.git',
+        }),
+        skills: ['one'],
+      },
+      { parsed: expect.objectContaining({ type: 'github', ref: 'v1' }), skills: ['two'] },
+      {
+        parsed: expect.objectContaining({ type: 'gitlab', ref: 'main', subpath: 'skills' }),
+        skills: [],
+      },
+    ]);
+  });
+
+  it('rejects sources that are not git-hosted', () => {
+    expect(parseSkillsField(['./local', 'https://example.com/skills'], 'my-pack').errors).toEqual([
+      'my-pack: "./local" is not a git source',
+      'my-pack: "https://example.com/skills" is not a git source',
+    ]);
+  });
+
+  it('rejects a ref on a source that already has one', () => {
+    expect(
+      parseSkillsField(
+        [
+          { source: 'owner/repo#v1', ref: 'v2' },
+          { source: 'https://github.com/o/r/tree/main/x', ref: 'v2' },
+        ],
+        '.'
+      ).errors
+    ).toEqual([
+      '.: "owner/repo#v1" already has a ref; remove "ref"',
+      '.: "https://github.com/o/r/tree/main/x" already has a ref; remove "ref"',
+    ]);
   });
 
   it('rejects ref on an npm: entry', () => {
     expect(parseSkillsField([{ source: 'npm:x', ref: 'v1' }], 'my-pack').errors).toEqual([
       'my-pack: "ref" cannot be used with "npm:x"',
     ]);
-  });
-
-  it('rejects an empty npm: package name', () => {
-    expect(parseSkillsField(['npm:'], '.').errors).toEqual(['.: "npm:" needs a package name']);
   });
 
   it('rejects malformed entries and keeps the valid ones', () => {

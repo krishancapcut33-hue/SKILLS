@@ -1,24 +1,35 @@
+import { parseSource } from './source-parser.ts';
+import type { ParsedSource } from './types.ts';
+
 /**
  * The `skills` field of package.json: skills a package wants installed
  * without shipping their files. Grammar: https://github.com/antfu/skills-npm/blob/main/SPEC.md
  */
-export type SkillsFieldEntry = string | { source: string; skills?: string[]; ref?: string };
+type SkillsFieldEntry = string | { source: string; skills?: string[]; ref?: string };
 
 /** `npm:<package>`: the skills shipped by an installed package. */
-export interface NpmSkillsRequest {
+interface NpmSkillsRequest {
   package: string;
   /** Folder or sanitized skill names to keep; empty means all. */
   skills: string[];
 }
 
-export interface ParsedSkillsField {
+/** A git source to install skills from. */
+export interface RemoteSkillsRequest {
+  parsed: ParsedSource;
+  /** Skill names to keep; empty means all. */
+  skills: string[];
+}
+
+interface ParsedSkillsField {
   npm: NpmSkillsRequest[];
-  /** Number of remote (git) entries; installing them is not supported yet. */
-  remote: number;
+  remote: RemoteSkillsRequest[];
   errors: string[];
 }
 
 const NPM_PREFIX = 'npm:';
+// the SPEC allows git-hosted sources only, not local paths or plain URLs
+const REMOTE_SOURCE_TYPES = new Set<ParsedSource['type']>(['github', 'gitlab', 'git']);
 
 function isSkillsFieldEntry(value: unknown): value is SkillsFieldEntry {
   if (typeof value === 'string') return true;
@@ -35,26 +46,30 @@ function isSkillsFieldEntry(value: unknown): value is SkillsFieldEntry {
 
 /** Parse the entries of `declarer`'s `skills` field. Problems are returned, not thrown. */
 export function parseSkillsField(entries: unknown[], declarer: string): ParsedSkillsField {
-  const parsed: ParsedSkillsField = { npm: [], remote: 0, errors: [] };
+  const parsed: ParsedSkillsField = { npm: [], remote: [], errors: [] };
 
   for (const raw of entries) {
     if (!isSkillsFieldEntry(raw)) {
       parsed.errors.push(`${declarer}: invalid "skills" entry ${JSON.stringify(raw)}`);
       continue;
     }
-    const entry = typeof raw === 'string' ? { source: raw } : raw;
-    if (!entry.source.startsWith(NPM_PREFIX)) {
-      parsed.remote++;
-      continue;
-    }
-
-    const name = entry.source.slice(NPM_PREFIX.length);
-    if (!name) {
-      parsed.errors.push(`${declarer}: "npm:" needs a package name`);
-    } else if ('ref' in entry && entry.ref !== undefined) {
-      parsed.errors.push(`${declarer}: "ref" cannot be used with "${entry.source}"`);
+    const { source, skills = [], ref } = typeof raw === 'string' ? { source: raw } : raw;
+    if (!source.startsWith(NPM_PREFIX)) {
+      const remote = parseSource(source);
+      if (!REMOTE_SOURCE_TYPES.has(remote.type)) {
+        parsed.errors.push(`${declarer}: "${source}" is not a git source`);
+      } else if (ref !== undefined && remote.ref !== undefined) {
+        parsed.errors.push(`${declarer}: "${source}" already has a ref; remove "ref"`);
+      } else {
+        parsed.remote.push({
+          parsed: { ...remote, ref: ref ?? remote.ref },
+          skills: remote.skillFilter ? [...skills, remote.skillFilter] : skills,
+        });
+      }
+    } else if (ref !== undefined) {
+      parsed.errors.push(`${declarer}: "ref" cannot be used with "${source}"`);
     } else {
-      parsed.npm.push({ package: name, skills: ('skills' in entry && entry.skills) || [] });
+      parsed.npm.push({ package: source.slice(NPM_PREFIX.length), skills });
     }
   }
 

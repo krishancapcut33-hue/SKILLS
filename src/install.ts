@@ -5,6 +5,7 @@ import { installFromSource, runAdd } from './add.ts';
 import { runSync, parseSyncOptions } from './sync.ts';
 import { getUniversalAgents } from './agents.ts';
 import { buildLocalUpdateSource } from './update-source.ts';
+import { parseSource } from './source-parser.ts';
 
 /**
  * Install all skills from the local skills-lock.json.
@@ -14,7 +15,7 @@ import { buildLocalUpdateSource } from './update-source.ts';
  * Only installs to .agents/skills/ (universal agents) -- the canonical
  * project-level location. Does not install to agent-specific directories.
  *
- * node_modules skills are handled via experimental_sync.
+ * node_modules skills are handled via sync.
  */
 export async function runInstallFromLock(args: string[]): Promise<void> {
   const cwd = process.cwd();
@@ -74,7 +75,10 @@ export async function runInstallFromLock(args: string[]): Promise<void> {
       await runAdd([source], { skill: skills, agent: universalAgentNames, yes: true });
       continue;
     }
-    const result = await installFromSource(source, { skills, agents: universalAgentNames });
+    const result = await installFromSource(parseSource(source), {
+      skills,
+      agents: universalAgentNames,
+    });
     if (result.error) {
       p.log.error(`Failed to install from ${pc.cyan(source)}: ${result.error}`);
       process.exitCode = 1;

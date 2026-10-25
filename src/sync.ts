@@ -1,8 +1,9 @@
 import * as p from '@clack/prompts';
 import pc from 'picocolors';
 import { existsSync } from 'fs';
-import { lstat, readdir, readFile, readlink, realpath, rm } from 'fs/promises';
-import { basename, dirname, join, posix, resolve, sep } from 'path';
+import { glob, lstat, readdir, readFile, readlink, realpath, rm } from 'fs/promises';
+import { basename, dirname, join, posix, relative, resolve, sep } from 'path';
+import { parse as parseYaml } from 'yaml';
 import { homedir } from 'os';
 import { hasSkillMd, parseSkillMd } from './skills.ts';
 import {
@@ -32,7 +33,9 @@ import {
 import type { Skill, AgentType } from './types.ts';
 import { track } from './telemetry.ts';
 import { detectAgent, getAgentType } from './detect-agent.ts';
-import { parseSkillsField } from './skills-field.ts';
+import { getLastSelectedAgents, saveSelectedAgents } from './skill-lock.ts';
+import { parseSkillsField, type RemoteSkillsRequest } from './skills-field.ts';
+import { getProjectLockSource, installFromSource } from './add.ts';
 
 const isCancelled = (value: unknown): value is symbol => typeof value === 'symbol';
 
@@ -44,13 +47,18 @@ export interface SyncOptions {
   cleanup?: boolean;
   include?: string[];
   exclude?: string[];
+  remote?: boolean;
+  recursive?: boolean;
 }
 
 /**
  * `<package>` matches every skill of a package, `<package>#<skill>` one of them.
  * Both parts are globs. Package names cannot contain `#`, so the split is unambiguous.
  */
-function matchesSkill(skill: PackageSkill, patterns: string[]): boolean {
+function matchesSkill(
+  skill: Pick<PackageSkill, 'name' | 'packageName'>,
+  patterns: string[]
+): boolean {
   return patterns.some((pattern) => {
     const hash = pattern.indexOf('#');
     const packagePattern = hash === -1 ? pattern : pattern.slice(0, hash);
@@ -60,6 +68,16 @@ function matchesSkill(skill: PackageSkill, patterns: string[]): boolean {
       posix.matchesGlob(sanitizeName(skill.name), skillPattern)
     );
   });
+}
+
+function allowedByFilters(
+  skill: Pick<PackageSkill, 'name' | 'packageName'>,
+  { include, exclude }: SyncOptions
+): boolean {
+  return (
+    (!include?.length || matchesSkill(skill, include)) &&
+    !(exclude?.length && matchesSkill(skill, exclude))
+  );
 }
 
 /**
@@ -88,9 +106,13 @@ interface PackageSkill extends Skill {
 }
 
 interface PackageJson {
+  name?: string;
   version?: string;
+  workspaces?: string[] | { packages?: string[] };
   dependencies?: Record<string, string>;
   devDependencies?: Record<string, string>;
+  optionalDependencies?: Record<string, string>;
+  peerDependencies?: Record<string, string>;
   /** Validated by parseSkillsField. */
   skills?: unknown;
 }
@@ -140,9 +162,6 @@ async function discoverPackageSkills(
   return skills;
 }
 
-/** A problem in the project's own `skills` field; sync stops instead of guessing. */
-class SkillsFieldError extends Error {}
-
 /**
  * Node's node_modules lookup from `from` (realpath, then walk up), so the
  * declaring package's own dependencies resolve in pnpm's isolated layout.
@@ -155,6 +174,60 @@ function findInstalledPackage(from: string, name: string): string | undefined {
   }
 }
 
+type FieldRemoteRequest = RemoteSkillsRequest & { via: string; declarers: string[] };
+
+function remoteAllowsSkill(
+  request: FieldRemoteRequest,
+  name: string,
+  options: SyncOptions
+): boolean {
+  return request.declarers.some((packageName) => allowedByFilters({ name, packageName }, options));
+}
+
+/** Drop excluded packages before fetching; skill patterns are also applied after discovery. */
+function filterRemoteRequests(
+  requests: FieldRemoteRequest[],
+  options: SyncOptions
+): FieldRemoteRequest[] {
+  return requests.flatMap((request) => {
+    const declarers = request.declarers.filter(
+      (name) =>
+        (!options.include?.length ||
+          options.include.some((p) => posix.matchesGlob(name, p.split('#')[0]!))) &&
+        !options.exclude?.some((p) => !p.includes('#') && posix.matchesGlob(name, p))
+    );
+    if (declarers.length === 0) return [];
+    const filtered = { ...request, via: declarers[0]!, declarers };
+    if (request.skills.length === 0) return [filtered];
+    const skills = request.skills.filter((name) => remoteAllowsSkill(filtered, name, options));
+    return skills.length > 0 ? [{ ...filtered, skills }] : [];
+  });
+}
+
+function requestsLockedSkill(
+  request: FieldRemoteRequest,
+  name: string,
+  entry: LocalSkillLockEntry
+) {
+  return (
+    isFromRequest(entry, request) &&
+    (request.skills.length === 0 ||
+      request.skills.some(
+        (selected) =>
+          sanitizeName(selected) === sanitizeName(name) ||
+          selected === posix.basename(posix.dirname(entry.skillPath ?? ''))
+      ))
+  );
+}
+
+/** Every package the project declares; a missing one (e.g. an omitted optional) is skipped. */
+const DEPENDENCY_FIELDS = [
+  'dependencies',
+  'devDependencies',
+  'optionalDependencies',
+  'peerDependencies',
+] as const;
+
 /**
  * Find skills shipped by the project's direct dependencies, plus the skills
  * that `npm:` entries in `skills` fields point at. Fields are read from the
@@ -164,13 +237,48 @@ function findInstalledPackage(from: string, name: string): string | undefined {
  * reaches the agent only when a direct dependency names it, and the package
  * manager's version resolution decides which copy of a package is seen.
  */
+/** Directories of the workspace packages declared in pnpm-workspace.yaml or package.json. */
+async function findWorkspacePackages(cwd: string, pkg: PackageJson): Promise<string[]> {
+  const patterns = [
+    ...(Array.isArray(pkg.workspaces) ? pkg.workspaces : (pkg.workspaces?.packages ?? [])),
+  ];
+  try {
+    const pnpm: unknown = parseYaml(await readFile(join(cwd, 'pnpm-workspace.yaml'), 'utf-8'));
+    if (pnpm && typeof pnpm === 'object' && 'packages' in pnpm && Array.isArray(pnpm.packages)) {
+      patterns.push(...pnpm.packages.filter((p) => typeof p === 'string'));
+    }
+  } catch {
+    // no pnpm workspace
+  }
+
+  const negated = patterns.filter((p) => p.startsWith('!')).map((p) => p.slice(1));
+  const included = patterns.filter((p) => !p.startsWith('!'));
+  const dirs = new Set<string>();
+  for await (const file of glob(
+    included.map((p) => posix.join(p, 'package.json')),
+    { cwd, exclude: (path) => basename(path) === 'node_modules' }
+  )) {
+    const dir = dirname(file).split(sep).join('/');
+    if (dir !== '.' && !negated.some((n) => posix.matchesGlob(dir, n))) dirs.add(join(cwd, dir));
+  }
+  return [...dirs].sort();
+}
+
 async function discoverNodeModuleSkills(
-  cwd: string
-): Promise<{ skills: PackageSkill[]; warnings: string[]; remoteEntries: number }> {
+  cwd: string,
+  recursive: boolean
+): Promise<{
+  skills: PackageSkill[];
+  remote: FieldRemoteRequest[];
+  warnings: string[];
+  errors: string[];
+}> {
   const warnings: string[] = [];
-  let remoteEntries = 0;
+  const errors: string[] = [];
+  // identical requests from several packages are one
+  const remote = new Map<string, FieldRemoteRequest>();
   const pkg = await readPackageJson(cwd);
-  if (!pkg) return { skills: [], warnings, remoteEntries };
+  if (!pkg) return { skills: [], remote: [], warnings, errors };
 
   const skills: PackageSkill[] = [];
   const seen = new Set<string>();
@@ -183,46 +291,66 @@ async function discoverNodeModuleSkills(
     }
   };
 
-  const deps = [
-    ...new Set([...Object.keys(pkg.dependencies ?? {}), ...Object.keys(pkg.devDependencies ?? {})]),
-  ];
-  const shipped = await Promise.all(
-    deps.map((name) => discoverPackageSkills(join(cwd, 'node_modules', name), name, 0))
-  );
-  await add(shipped.flat());
+  // the project, then with --recursive each workspace package, one level further away
+  const projects = [{ name: '.', dir: cwd, pkg, depth: 0 }];
+  for (const dir of recursive ? await findWorkspacePackages(cwd, pkg) : []) {
+    const workspacePkg = await readPackageJson(dir);
+    const name = workspacePkg?.name ?? relative(cwd, dir).split(sep).join('/');
+    if (workspacePkg) projects.push({ name, dir, pkg: workspacePkg, depth: 1 });
+  }
 
-  // `depth` is what this declarer's npm: targets get; strict fields fail the run
-  const declarers = [
-    { name: '.', dir: cwd, depth: 0, strict: true },
-    ...deps.map((name) => ({
-      name,
-      dir: join(cwd, 'node_modules', name),
-      depth: 1,
-      strict: false,
-    })),
-  ];
+  // `depth` is what this declarer's npm: targets get
+  const declarers: Array<{ name: string; dir: string; depth: number }> = [];
+  for (const project of projects) {
+    const deps = new Set(
+      DEPENDENCY_FIELDS.flatMap((field) => Object.keys(project.pkg[field] ?? {}))
+    );
+    const installed = [...deps].flatMap((name) => {
+      const dir = findInstalledPackage(project.dir, name);
+      return dir ? [{ name, dir }] : [];
+    });
+    const shipped = await Promise.all(
+      installed.map(({ name, dir }) => discoverPackageSkills(dir, name, project.depth))
+    );
+    await add(shipped.flat());
+    declarers.push(
+      { name: project.name, dir: project.dir, depth: project.depth },
+      ...installed.map(({ name, dir }) => ({ name, dir, depth: project.depth + 1 }))
+    );
+  }
   const visited = new Set<string>();
   for (const declarer of declarers) {
     const dir = await realpath(declarer.dir).catch(() => null);
     if (!dir || visited.has(dir)) continue;
     visited.add(dir);
 
+    // the project's own field must be valid; a dependency's only produces warnings
+    const problems = declarer.name === '.' ? errors : warnings;
     const field = (await readPackageJson(dir))?.skills;
     if (field === undefined) continue;
     if (!Array.isArray(field)) {
       // a dependency may use the key for something else
-      if (declarer.strict) throw new SkillsFieldError('package.json: "skills" must be an array');
+      if (problems === errors) errors.push('package.json: "skills" must be an array');
       continue;
     }
 
     const parsed = parseSkillsField(field, declarer.name);
-    remoteEntries += parsed.remote;
-    const problems = [...parsed.errors];
+    problems.push(...parsed.errors);
+    for (const request of parsed.remote) {
+      const { url, ref, subpath } = request.parsed;
+      const key = JSON.stringify([url, ref, subpath, request.skills]);
+      const existing = remote.get(key);
+      if (existing) {
+        if (!existing.declarers.includes(declarer.name)) existing.declarers.push(declarer.name);
+      } else {
+        remote.set(key, { ...request, via: declarer.name, declarers: [declarer.name] });
+      }
+    }
     for (const request of parsed.npm) {
       const target = findInstalledPackage(dir, request.package);
       if (!target) {
         problems.push(
-          `${declarer.name}: cannot resolve "npm:${request.package}"; add it to the dependencies of ${declarer.name === '.' ? 'package.json' : declarer.name}`
+          `${declarer.name}: cannot resolve "npm:${request.package}"; is it a dependency?`
         );
         continue;
       }
@@ -237,28 +365,26 @@ async function discoverNodeModuleSkills(
           )
           .map((skill) => ({ ...skill, via: declarer.name }))
       );
-      declarers.push({
-        name: request.package,
-        dir: target,
-        depth: declarer.depth + 1,
-        strict: false,
-      });
+      declarers.push({ name: request.package, dir: target, depth: declarer.depth + 1 });
     }
-    if (declarer.strict && problems.length > 0) throw new SkillsFieldError(problems.join('\n'));
-    warnings.push(...problems);
   }
 
-  return { skills, warnings, remoteEntries };
+  return { skills, remote: [...remote.values()], warnings, errors };
 }
 
 function isUnderNodeModules(path: string): boolean {
   return path.split(sep).includes('node_modules');
 }
 
+/** Sync installed this skill: shipped by a package, or requested by a `skills` field. */
+function installedBySync(entry: LocalSkillLockEntry | undefined): boolean {
+  return entry?.sourceType === 'node_modules' || entry?.via !== undefined;
+}
+
 /**
  * Why `dest` must not be touched, or null when it is free or already ours.
  * Sync owns a symlink whose target is in node_modules or is the canonical dir,
- * and a real directory that the lock attributes to node_modules.
+ * and a real directory whose lock entry sync wrote.
  */
 async function foreignDestination(
   dest: string,
@@ -277,7 +403,7 @@ async function foreignDestination(
     if (isUnderNodeModules(target) || target === canonicalDir) return null;
     return `${shortenPath(dest, cwd)} is a symlink to ${shortenPath(target, cwd)}`;
   }
-  if (lockEntry?.sourceType === 'node_modules') return null;
+  if (installedBySync(lockEntry)) return null;
   return `${shortenPath(dest, cwd)} already exists and was not installed by sync`;
 }
 
@@ -291,13 +417,15 @@ async function linksIntoNodeModules(path: string): Promise<boolean> {
 }
 
 /**
- * Remove skills that sync installed earlier and no dependency ships anymore.
- * A name is a candidate when its lock entry comes from node_modules or its
- * canonical dir links into node_modules. Only destinations sync owns are removed.
+ * Remove skills that sync installed earlier and nothing provides anymore.
+ * A name is a candidate when its lock entry comes from node_modules, or from a
+ * remote `skills` entry that `keepRemote` rejects, or when its canonical dir
+ * links into node_modules. Only destinations sync owns are removed.
  */
 async function pruneStaleSkills(
   cwd: string,
   keep: Set<string>,
+  keepRemote: (entry: LocalSkillLockEntry, name: string) => boolean,
   lock: LocalSkillLockFile,
   dryRun: boolean
 ): Promise<string[]> {
@@ -305,8 +433,12 @@ async function pruneStaleSkills(
   const lockKeys = new Map<string, string>();
   const explicit = new Set<string>();
   for (const [key, entry] of Object.entries(lock.skills)) {
-    if (entry.sourceType === 'node_modules') lockKeys.set(sanitizeName(key), key);
-    else explicit.add(sanitizeName(key));
+    const remote = entry.sourceType !== 'node_modules';
+    if (installedBySync(entry) && !(remote && keepRemote(entry, key))) {
+      lockKeys.set(sanitizeName(key), key);
+    } else {
+      explicit.add(sanitizeName(key));
+    }
   }
 
   const candidates = new Set(lockKeys.keys());
@@ -336,17 +468,44 @@ async function pruneStaleSkills(
   return stale;
 }
 
+/**
+ * Why sync must not install `name`, or null: a skill installed with
+ * `skills add` is never shadowed, and a destination sync does not own is
+ * never replaced.
+ */
+async function blockedReason(
+  name: string,
+  targetAgents: AgentType[],
+  lockEntry: LocalSkillLockEntry | undefined,
+  cwd: string
+): Promise<string | null> {
+  if (lockEntry && !installedBySync(lockEntry)) {
+    return `installed with \`skills add\` from ${lockEntry.source}`;
+  }
+  const canonicalDir = getCanonicalPath(name, { cwd });
+  const destinations = new Set([
+    canonicalDir,
+    ...targetAgents.map((agent) => getInstallPath(name, agent, { cwd })),
+  ]);
+  for (const dest of destinations) {
+    const reason = await foreignDestination(dest, canonicalDir, lockEntry, cwd);
+    if (reason) return reason;
+  }
+  return null;
+}
+
 interface SkippedSkill {
   skill: PackageSkill;
   reason: string;
 }
 
 /**
- * Conflict rules, in order:
- * 1. a skill installed with `skills add` is never shadowed
- * 2. a directory or symlink sync does not own is never replaced
- * 3. a skill from a direct dependency wins over one from a transitive package
- * 4. two packages at the same depth shipping the same skill name install neither
+ * Conflict rules for shipped skills, in order:
+ * 1. a skill from a direct dependency wins over one from a transitive package
+ * 2. two packages at the same depth shipping the same skill name install neither
+ * 3. blockedReason: never shadow `skills add`, never replace what sync does not own
+ *
+ * A shipped skill replaces one that a remote `skills` entry installed.
  */
 async function resolveConflicts(
   skills: PackageSkill[],
@@ -380,22 +539,7 @@ async function resolveConflicts(
     }
 
     const skill = candidates[0]!;
-    const lockEntry = lockBySanitizedName.get(name);
-    if (lockEntry && lockEntry.sourceType !== 'node_modules') {
-      skipped.push({ skill, reason: `installed with \`skills add\` from ${lockEntry.source}` });
-      continue;
-    }
-
-    const canonicalDir = getCanonicalPath(name, { cwd });
-    const destinations = new Set([
-      canonicalDir,
-      ...targetAgents.map((agent) => getInstallPath(name, agent, { cwd })),
-    ]);
-    let reason: string | null = null;
-    for (const dest of destinations) {
-      reason = await foreignDestination(dest, canonicalDir, lockEntry, cwd);
-      if (reason) break;
-    }
+    const reason = await blockedReason(name, targetAgents, lockBySanitizedName.get(name), cwd);
     if (reason) {
       skipped.push({ skill, reason });
     } else {
@@ -404,6 +548,65 @@ async function resolveConflicts(
   }
 
   return { install, skipped };
+}
+
+/**
+ * Ask which agents to sync to, with universal agents always included.
+ * Preselects the last choice from `skills add` or sync when it is still offered.
+ */
+async function promptForAgentChoice(
+  choices: AgentType[],
+  fallback: AgentType[]
+): Promise<AgentType[] | symbol> {
+  const universalAgents = getUniversalAgents();
+  const visibleUniversalAgents = getVisibleUniversalAgents();
+  const last = await getLastSelectedAgents().catch(() => undefined);
+  const remembered = choices.filter((a) => last?.includes(a));
+
+  const selected = await searchMultiselect({
+    message: 'Which agents do you want to install to?',
+    items: choices.map((a) => ({
+      value: a,
+      label: agents[a].displayName,
+      hint: agents[a].skillsDir,
+    })),
+    initialSelected: remembered.length > 0 ? remembered : fallback,
+    lockedSection: {
+      title: 'Universal (.agents/skills)',
+      items: visibleUniversalAgents.map((a) => ({ value: a, label: agents[a].displayName })),
+      hiddenCount: universalAgents.length - visibleUniversalAgents.length,
+    },
+  });
+  if (!isCancelled(selected)) {
+    await saveSelectedAgents(selected as string[]).catch(() => {});
+  }
+  return selected as AgentType[] | symbol;
+}
+
+/** `entry` was installed by sync for the remote `skills` entry `request`. */
+function isFromRequest(entry: LocalSkillLockEntry, request: FieldRemoteRequest): boolean {
+  return (
+    entry.via !== undefined &&
+    entry.source === getProjectLockSource(request.parsed) &&
+    entry.ref === request.parsed.ref
+  );
+}
+
+/** Every skill `request` asks for is in the lock and on disk; `skills update` refreshes them. */
+function isRemoteInstalled(
+  request: FieldRemoteRequest,
+  lock: LocalSkillLockFile,
+  cwd: string
+): boolean {
+  const installed = Object.entries(lock.skills)
+    .filter(
+      ([name, entry]) =>
+        isFromRequest(entry, request) && existsSync(getCanonicalPath(name, { cwd }))
+    )
+    .map(([name]) => sanitizeName(name));
+  return request.skills.length === 0
+    ? installed.length > 0
+    : request.skills.every((name) => installed.includes(sanitizeName(name)));
 }
 
 export async function runSync(args: string[], options: SyncOptions = {}): Promise<void> {
@@ -442,57 +645,74 @@ export async function runSync(args: string[], options: SyncOptions = {}): Promis
 
   // 1. Discover skills from node_modules
   spinner.start('Scanning node_modules for skills…');
-  let discovery: Awaited<ReturnType<typeof discoverNodeModuleSkills>>;
-  try {
-    discovery = await discoverNodeModuleSkills(cwd);
-  } catch (error) {
-    if (!(error instanceof SkillsFieldError)) throw error;
+  const discovery = await discoverNodeModuleSkills(cwd, options.recursive ?? false);
+  if (discovery.errors.length > 0) {
     spinner.stop(pc.red('Invalid skills field'));
-    for (const line of error.message.split('\n')) p.log.error(line);
+    for (const error of discovery.errors) p.log.error(error);
     p.outro(pc.red('Fix the "skills" field in package.json and run sync again.'));
     process.exitCode = 1;
     return;
   }
-  const { include, exclude } = options;
-  const discoveredSkills = discovery.skills.filter(
-    (skill) =>
-      (!include?.length || matchesSkill(skill, include)) &&
-      !(exclude?.length && matchesSkill(skill, exclude))
-  );
+  const discoveredSkills = discovery.skills.filter((skill) => allowedByFilters(skill, options));
+  const remote = filterRemoteRequests(discovery.remote, options);
   spinner.stop(
     discoveredSkills.length === 0
       ? pc.yellow('No skills found')
       : `Found ${pc.green(String(discoveredSkills.length))} skill${discoveredSkills.length > 1 ? 's' : ''} in node_modules`
   );
   for (const warning of discovery.warnings) p.log.warn(warning);
-  if (discovery.remoteEntries > 0) {
-    p.log.info(
-      pc.dim(
-        `Skipped ${discovery.remoteEntries} remote "skills" entr${discovery.remoteEntries === 1 ? 'y' : 'ies'}; only npm: entries are synced for now`
-      )
-    );
-  }
 
   const localLock = await readLocalLock(cwd);
   if (options.cleanup !== false) {
     const keep = new Set(discoveredSkills.map((skill) => sanitizeName(skill.name)));
-    const stale = await pruneStaleSkills(cwd, keep, localLock, options.dryRun ?? false);
+    // --no-remote leaves remote skills alone, both installing and removing
+    const keepRemote = (entry: LocalSkillLockEntry, name: string) =>
+      options.remote === false ||
+      remote.some(
+        (r) => requestsLockedSkill(r, name, entry) && remoteAllowsSkill(r, name, options)
+      );
+    const stale = await pruneStaleSkills(cwd, keep, keepRemote, localLock, options.dryRun ?? false);
     for (const name of stale) {
       p.log.info(
-        `${options.dryRun ? 'Would remove' : 'Removed'} ${pc.cyan(name)} ${pc.dim('(no longer shipped by a dependency)')}`
+        `${options.dryRun ? 'Would remove' : 'Removed'} ${pc.cyan(name)} ${pc.dim('(no longer provided by a dependency)')}`
       );
     }
   }
 
-  if (discoveredSkills.length === 0) {
-    p.outro(pc.dim('No SKILL.md files found in the dependencies listed in package.json.'));
+  const remoteRequests = (options.remote === false ? [] : remote).filter(
+    (request) => !isRemoteInstalled(request, localLock, cwd)
+  );
+  const cachedRemoteSkills: Array<{ skill: Skill; source: string }> = [];
+  if (options.remote !== false) {
+    const shippedNames = new Set(discoveredSkills.map((skill) => sanitizeName(skill.name)));
+    for (const [name, entry] of Object.entries(localLock.skills)) {
+      if (shippedNames.has(sanitizeName(name))) continue;
+      if (
+        !remote.some(
+          (request) =>
+            !remoteRequests.includes(request) &&
+            requestsLockedSkill(request, name, entry) &&
+            remoteAllowsSkill(request, name, options)
+        )
+      )
+        continue;
+      const skill = await parseSkillMd(join(getCanonicalPath(name, { cwd }), 'SKILL.md'));
+      if (skill) cachedRemoteSkills.push({ skill, source: entry.source });
+    }
+  }
+
+  if (
+    discoveredSkills.length === 0 &&
+    remoteRequests.length === 0 &&
+    cachedRemoteSkills.length === 0
+  ) {
+    p.outro(pc.dim('Nothing to sync.'));
     return;
   }
 
   // Show discovered skills
   for (const skill of discoveredSkills) {
-    const via = skill.via ? ` via ${skill.via}` : '';
-    p.log.info(`${pc.cyan(skill.name)} ${pc.dim(`from ${skill.packageName}${via}`)}`);
+    p.log.info(`${pc.cyan(skill.name)} ${pc.dim(`from ${skill.packageName}`)}`);
     if (skill.description) {
       p.log.message(pc.dim(`  ${skill.description}`));
     }
@@ -502,7 +722,6 @@ export async function runSync(args: string[], options: SyncOptions = {}): Promis
   let targetAgents: AgentType[];
   const validAgents = Object.keys(agents);
   const universalAgents = getUniversalAgents();
-  const visibleUniversalAgents = getVisibleUniversalAgents();
 
   if (options.agent?.includes('*')) {
     targetAgents = validAgents as AgentType[];
@@ -521,40 +740,9 @@ export async function runSync(args: string[], options: SyncOptions = {}): Promis
     const totalAgents = Object.keys(agents).length;
     spinner.stop(`${totalAgents} agents`);
 
-    if (installedAgents.length === 0) {
-      if (options.yes) {
-        targetAgents = universalAgents;
-        p.log.info('Installing to universal agents');
-      } else {
-        const otherAgents = getNonUniversalAgents();
-
-        const otherChoices = otherAgents.map((a) => ({
-          value: a,
-          label: agents[a].displayName,
-          hint: agents[a].skillsDir,
-        }));
-
-        const selected = await searchMultiselect({
-          message: 'Which agents do you want to install to?',
-          items: otherChoices,
-          initialSelected: [],
-          lockedSection: {
-            title: 'Universal (.agents/skills)',
-            items: visibleUniversalAgents.map((a) => ({
-              value: a,
-              label: agents[a].displayName,
-            })),
-            hiddenCount: universalAgents.length - visibleUniversalAgents.length,
-          },
-        });
-
-        if (isCancelled(selected)) {
-          p.cancel('Sync cancelled');
-          process.exit(0);
-        }
-
-        targetAgents = selected as AgentType[];
-      }
+    if (installedAgents.length === 0 && options.yes) {
+      targetAgents = universalAgents;
+      p.log.info('Installing to universal agents');
     } else if (installedAgents.length === 1 || options.yes) {
       // Ensure universal agents are included
       targetAgents = [...installedAgents];
@@ -564,34 +752,19 @@ export async function runSync(args: string[], options: SyncOptions = {}): Promis
         }
       }
     } else {
-      const otherAgents = getNonUniversalAgents().filter((a) => installedAgents.includes(a));
-
-      const otherChoices = otherAgents.map((a) => ({
-        value: a,
-        label: agents[a].displayName,
-        hint: agents[a].skillsDir,
-      }));
-
-      const selected = await searchMultiselect({
-        message: 'Which agents do you want to install to?',
-        items: otherChoices,
-        initialSelected: installedAgents.filter((a) => !universalAgents.includes(a)),
-        lockedSection: {
-          title: 'Universal (.agents/skills)',
-          items: visibleUniversalAgents.map((a) => ({
-            value: a,
-            label: agents[a].displayName,
-          })),
-          hiddenCount: universalAgents.length - visibleUniversalAgents.length,
-        },
-      });
-
+      // No detected agents: offer all; several: offer the detected ones
+      const choices = getNonUniversalAgents().filter(
+        (a) => installedAgents.length === 0 || installedAgents.includes(a)
+      );
+      const selected = await promptForAgentChoice(
+        choices,
+        installedAgents.filter((a) => !universalAgents.includes(a))
+      );
       if (isCancelled(selected)) {
         p.cancel('Sync cancelled');
         process.exit(0);
       }
-
-      targetAgents = selected as AgentType[];
+      targetAgents = selected;
     }
   }
 
@@ -605,7 +778,21 @@ export async function runSync(args: string[], options: SyncOptions = {}): Promis
   for (const { skill, reason } of skipped) {
     p.log.warn(`Skipped ${pc.cyan(skill.name)} ${pc.dim(`from ${skill.packageName}`)}: ${reason}`);
   }
-  if (toInstall.length === 0) {
+  const cachedToInstall: Array<{ skill: Skill; source: string; agents: AgentType[] }> = [];
+  for (const cached of cachedRemoteSkills) {
+    const { skill } = cached;
+    const missing = targetAgents.filter(
+      (agent) => !existsSync(getInstallPath(skill.name, agent, { cwd }))
+    );
+    if (missing.length === 0) continue;
+    const reason = await blockedReason(skill.name, missing, localLock.skills[skill.name], cwd);
+    if (reason) {
+      p.log.warn(`Skipped ${pc.cyan(skill.name)}: ${reason}`);
+    } else {
+      cachedToInstall.push({ ...cached, agents: missing });
+    }
+  }
+  if (toInstall.length === 0 && remoteRequests.length === 0 && cachedToInstall.length === 0) {
     console.log();
     p.outro(pc.yellow('Nothing to sync.'));
     return;
@@ -619,6 +806,17 @@ export async function runSync(args: string[], options: SyncOptions = {}): Promis
     summaryLines.push(`${pc.cyan(skill.name)} ${pc.dim(`← ${skill.packageName}`)}`);
     summaryLines.push(
       `  ${pc.dim(`${shortenPath(canonicalPath, cwd)} ${mode === 'link' ? '→' : 'copied from'} ${shortenPath(skill.path, cwd)}`)}`
+    );
+  }
+
+  for (const request of remoteRequests) {
+    summaryLines.push(
+      `${pc.cyan(getProjectLockSource(request.parsed))} ${pc.dim(`← ${request.via} (remote)`)}`
+    );
+  }
+  for (const { skill, source, agents: missing } of cachedToInstall) {
+    summaryLines.push(
+      `${pc.cyan(skill.name)} ${pc.dim(`← ${source} (cached), link to ${missing.join(', ')}`)}`
     );
   }
 
@@ -651,6 +849,25 @@ export async function runSync(args: string[], options: SyncOptions = {}): Promis
     canonicalPath?: string;
     error?: string;
   }> = [];
+
+  for (const { skill, source, agents: missing } of cachedToInstall) {
+    for (const agent of missing) {
+      const result = await installSkillForAgent(skill, agent, {
+        cwd,
+        mode: 'symlink',
+        createMissingAgentRoot: true,
+      });
+      results.push({
+        skill: skill.name,
+        packageName: source,
+        agent: agents[agent].displayName,
+        success: result.success,
+        path: result.path,
+        canonicalPath: result.canonicalPath,
+        error: result.error,
+      });
+    }
+  }
 
   for (const skill of toInstall) {
     for (const agent of targetAgents) {
@@ -701,7 +918,49 @@ export async function runSync(args: string[], options: SyncOptions = {}): Promis
     }
   }
 
-  // 7. Display results
+  // 7. Install skills that remote `skills` entries request
+  const claimed = new Set(discoveredSkills.map((skill) => sanitizeName(skill.name)));
+  const lockEntryFor = (name: string) =>
+    Object.entries(localLock.skills).find(([key]) => sanitizeName(key) === name)?.[1];
+  for (const request of remoteRequests) {
+    const label = getProjectLockSource(request.parsed);
+    const result = await installFromSource(request.parsed, {
+      skills: request.skills,
+      agents: targetAgents,
+      via: request.via,
+      select: async (skills) => {
+        const selected: Skill[] = [];
+        for (const skill of skills) {
+          const name = sanitizeName(skill.name);
+          if (!remoteAllowsSkill(request, name, options)) continue;
+          const reason = claimed.has(name)
+            ? 'another source in this sync provides it'
+            : await blockedReason(name, targetAgents, lockEntryFor(name), cwd);
+          if (reason) {
+            p.log.warn(`Skipped ${pc.cyan(name)} from ${label}: ${reason}`);
+            continue;
+          }
+          claimed.add(name);
+          selected.push(skill);
+        }
+        return selected;
+      },
+    });
+    if (result.error) {
+      p.log.error(`Failed to install from ${pc.cyan(label)}: ${result.error}`);
+      process.exitCode = 1;
+      continue;
+    }
+    if (result.installed.length > 0) {
+      p.log.success(
+        `Installed ${result.installed.map((name) => pc.cyan(name)).join(', ')} from ${label}`
+      );
+    }
+    for (const failure of result.failed) p.log.error(failure);
+    if (result.failed.length > 0) process.exitCode = 1;
+  }
+
+  // 8. Display results
   console.log();
 
   if (successful.length > 0) {
@@ -715,7 +974,7 @@ export async function runSync(args: string[], options: SyncOptions = {}): Promis
     const resultLines: string[] = [];
     for (const [skillName, skillResults] of bySkill) {
       const firstResult = skillResults[0]!;
-      const pkg = toInstall.find((s) => s.name === skillName)?.packageName;
+      const pkg = firstResult.packageName;
       if (firstResult.canonicalPath) {
         const shortPath = shortenPath(firstResult.canonicalPath, cwd);
         resultLines.push(`${pc.green('✓')} ${skillName} ${pc.dim(`← ${pkg}`)}`);
@@ -731,6 +990,7 @@ export async function runSync(args: string[], options: SyncOptions = {}): Promis
   }
 
   if (failed.length > 0) {
+    process.exitCode = 1;
     console.log();
     p.log.error(pc.red(`Failed to install ${failed.length}`));
     for (const r of failed) {
@@ -741,7 +1001,7 @@ export async function runSync(args: string[], options: SyncOptions = {}): Promis
   // Track telemetry
   track({
     event: 'experimental_sync',
-    skillCount: String(toInstall.length),
+    skillCount: String(toInstall.length + cachedToInstall.length),
     successCount: String(successfulSkillNames.size),
     agents: targetAgents.join(','),
   });
@@ -773,6 +1033,10 @@ export function parseSyncOptions(args: string[]): { options: SyncOptions } {
       options.dryRun = true;
     } else if (arg === '--no-cleanup') {
       options.cleanup = false;
+    } else if (arg === '--no-remote') {
+      options.remote = false;
+    } else if (arg === '-r' || arg === '--recursive') {
+      options.recursive = true;
     } else if (arg === '-a' || arg === '--agent') {
       options.agent = [...(options.agent ?? []), ...takeValues()];
     } else if (arg === '--include') {
