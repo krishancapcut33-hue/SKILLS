@@ -103,6 +103,43 @@ function showBanner(): void {
 }
 
 function showHelp(): void {
+  const examples: Array<[command: string, description?: string]> = [
+    ['skills add vercel-labs/agent-skills'],
+    ['skills use vercel-labs/agent-skills@vercel-optimize | claude'],
+    ['skills use vercel-labs/agent-skills --skill vercel-optimize --agent claude-code'],
+    ['skills add vercel-labs/agent-skills -g'],
+    ['skills add vercel-labs/agent-skills --agent claude-code cursor'],
+    ['skills add vercel-labs/agent-skills --skill pr-review commit'],
+    ['skills add vercel-labs/agent-skills --json -y', 'JSON output'],
+    ['skills remove', 'interactive remove'],
+    ['skills remove web-design', 'remove by name'],
+    ['skills rm --global frontend-design'],
+    ['skills list', 'list project skills'],
+    ['skills ls -g', 'list global skills'],
+    ['skills ls -a claude-code', 'filter by agent'],
+    ['skills ls --json', 'JSON output'],
+    ['skills find', 'interactive search'],
+    ['skills find typescript', 'search by keyword'],
+    ['skills find react --owner vercel', 'search within an owner'],
+    ['skills update'],
+    ['skills update my-skill', 'update a single skill'],
+    ['skills update -g', 'update global skills only'],
+    ['skills experimental_install', 'restore from skills-lock.json'],
+    ['skills init my-skill'],
+    ['skills experimental_sync', 'sync from node_modules (experimental)'],
+    ['skills experimental_sync -y', 'sync without prompts'],
+  ];
+  const exampleWidth = Math.max(
+    ...examples.filter(([, description]) => description).map(([command]) => command.length)
+  );
+  const formattedExamples = examples
+    .map(([command, description]) => {
+      const comment = description
+        ? `${' '.repeat(exampleWidth - command.length + 2)}${DIM}# ${description}${RESET}`
+        : '';
+      return `  ${DIM}$${RESET} ${command}${comment}`;
+    })
+    .join('\n');
   console.log(`
 ${BOLD}Usage:${RESET} skills <command> [options]
 
@@ -132,7 +169,7 @@ ${BOLD}Update Options:${RESET}
 ${BOLD}Project:${RESET}
   experimental_install Restore skills from skills-lock.json
   init [name]          Initialize a skill (creates <name>/SKILL.md or ./SKILL.md)
-  experimental_sync    Sync skills from node_modules into agent directories
+  experimental_sync    Sync skills from node_modules into agent directories (alias: sync)
 
 ${BOLD}Add Options:${RESET}
   -g, --global           Install skill globally (user-level) instead of project-level
@@ -180,30 +217,7 @@ ${BOLD}Options:${RESET}
   --version, -v     Show version number
 
 ${BOLD}Examples:${RESET}
-  ${DIM}$${RESET} skills add vercel-labs/agent-skills
-  ${DIM}$${RESET} skills use vercel-labs/agent-skills@vercel-optimize | claude
-  ${DIM}$${RESET} skills use vercel-labs/agent-skills --skill vercel-optimize --agent claude-code
-  ${DIM}$${RESET} skills add vercel-labs/agent-skills -g
-  ${DIM}$${RESET} skills add vercel-labs/agent-skills --agent claude-code cursor
-  ${DIM}$${RESET} skills add vercel-labs/agent-skills --skill pr-review commit
-  ${DIM}$${RESET} skills add vercel-labs/agent-skills --json -y ${DIM}# JSON output${RESET}
-  ${DIM}$${RESET} skills remove                        ${DIM}# interactive remove${RESET}
-  ${DIM}$${RESET} skills remove web-design             ${DIM}# remove by name${RESET}
-  ${DIM}$${RESET} skills rm --global frontend-design
-  ${DIM}$${RESET} skills list                          ${DIM}# list project skills${RESET}
-  ${DIM}$${RESET} skills ls -g                         ${DIM}# list global skills${RESET}
-  ${DIM}$${RESET} skills ls -a claude-code             ${DIM}# filter by agent${RESET}
-  ${DIM}$${RESET} skills ls --json                      ${DIM}# JSON output${RESET}
-  ${DIM}$${RESET} skills find                          ${DIM}# interactive search${RESET}
-  ${DIM}$${RESET} skills find typescript               ${DIM}# search by keyword${RESET}
-  ${DIM}$${RESET} skills find react --owner vercel     ${DIM}# search within an owner${RESET}
-  ${DIM}$${RESET} skills update
-  ${DIM}$${RESET} skills update my-skill             ${DIM}# update a single skill${RESET}
-  ${DIM}$${RESET} skills update -g                    ${DIM}# update global skills only${RESET}
-  ${DIM}$${RESET} skills experimental_install            ${DIM}# restore from skills-lock.json${RESET}
-  ${DIM}$${RESET} skills init my-skill
-  ${DIM}$${RESET} skills experimental_sync              ${DIM}# sync from node_modules${RESET}
-  ${DIM}$${RESET} skills experimental_sync -y           ${DIM}# sync without prompts${RESET}
+${formattedExamples}
 
 Discover more skills at ${TEXT}https://skills.sh/${RESET}
 `);
@@ -392,6 +406,7 @@ async function main(): Promise<void> {
       await removeCommand(skills, removeOptions);
       break;
     }
+    case 'sync':
     case 'experimental_sync': {
       if (!inAgent) showLogo();
       const { options: syncOptions } = parseSyncOptions(restArgs);
